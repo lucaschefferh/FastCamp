@@ -133,6 +133,18 @@ Foram treinadas quatro iterações, testando arquitetura, tamanho de encoder e r
 
 **Melhor modelo: UNet++ / EfficientNet-B2.** Não é o de Dice/IoU absolutamente mais alto — os encoders maiores (ResNet34, EfficientNet-B4) chegam a 0.75–0.76 — mas apresenta de longe o menor gap treino/validação do experimento (0.04 contra 0.28–0.34) e o maior recall entre os seis modelos (0.82), a métrica mais relevante em contexto clínico (menor chance de deixar passar um tumor). O detalhamento de cada iteração, as causas do overfitting e a justificativa das escolhas estão no relatório final.
 
+### Exemplos de segmentação
+
+Predições do melhor modelo (UNet++ / EfficientNet-B2) no conjunto de teste — 2 dos melhores casos e 2 dos piores, lado a lado com a imagem original e o ground truth:
+
+![Exemplos de segmentação: imagem original, ground truth e predição](results/unetpp_efficientnet-b2_v1/sample_predictions.png)
+
+Nos dois melhores casos (tumores grandes e bem definidos) a predição praticamente coincide com o ground truth. Nos dois piores casos, ambos têm tumores muito pequenos (poucas dezenas de pixels) — o modelo captou parcialmente um e não detectou o outro. Essa é a principal limitação observada: **tumores pequenos são consistentemente mais difíceis de segmentar** do que tumores grandes, independentemente do modelo.
+
+Distribuição de Dice e IoU no conjunto de teste completo, separando fatias com e sem tumor:
+
+![Distribuição de Dice e IoU no conjunto de teste](results/unetpp_efficientnet-b2_v1/metrics_distribution.png)
+
 ## Arquitetura e Treinamento
 
 - **Modelos:** U-Net, U-Net++ e DeepLabV3+ via `segmentation-models-pytorch`
