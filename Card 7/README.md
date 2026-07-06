@@ -1,10 +1,10 @@
 # Brain MRI Segmentation — LGG Tumor
 
-Segmentação semântica de tumores cerebrais (Low-Grade Glioma) em imagens de MRI, usando PyTorch e `segmentation-models-pytorch`. O projeto cobre o pipeline completo: divisão do dataset, treinamento e inferência com avaliação quantitativa e visual.
+Segmentação semântica de tumores cerebrais (Low-Grade Glioma) em imagens de MRI, usando PyTorch e `segmentation-models-pytorch`. O projeto cobre o pipeline completo: divisão do dataset, treinamento, inferência e análise quantitativa/visual dos resultados, com quatro iterações de treino documentadas em [`Relatório 7 - Lucas Scheffer.docx`](Relatório%207%20-%20Lucas%20Scheffer.docx).
 
 ## Dataset
 
-[LGG Segmentation Dataset (Kaggle)](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation) — 110 pacientes do TCGA, imagens FLAIR em `.tif` com máscaras binárias de segmentação.
+[LGG Segmentation Dataset (Kaggle)](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation) — 110 pacientes do TCGA, imagens FLAIR em `.tif` com máscaras binárias de segmentação (3929 pares imagem/máscara, ~35% com tumor / 65% sem tumor).
 
 ```
 archive/kaggle_3m/
@@ -20,15 +20,19 @@ archive/kaggle_3m/
 ├── src/
 │   ├── split_dataset.py   # divide o dataset por paciente (70/15/15 %)
 │   ├── dataset.py         # BrainMRIDataset, transforms, dataloaders
-│   ├── train.py           # loop de treinamento com early stopping
-│   └── inference.py       # inferência no conjunto de teste + métricas + visualizações
+│   ├── models.py          # registro central de arquiteturas (build_model)
+│   ├── metrics.py         # Dice/IoU (batch) e métricas por amostra
+│   ├── train.py           # loop de treinamento com early stopping e versionamento de runs
+│   ├── inference.py       # inferência no conjunto de teste (métricas + máscaras preditas)
+│   ├── analysis.py        # resumo estatístico e visualizações a partir da inferência
+│   └── plot_history.py    # curvas de treino a partir dos CSVs de histórico
 ├── archive/kaggle_3m/     # dataset original (não versionado)
 ├── dataset/               # splits gerados por split_dataset.py (não versionado)
 │   ├── train/images+masks
 │   ├── val/images+masks
 │   └── test/images+masks
-├── checkpoints/           # melhores pesos e histórico CSV por modelo
-├── results/               # métricas e grades visuais por modelo
+├── checkpoints/           # melhores pesos e histórico CSV por modelo/run (não versionado)
+├── results/               # métricas, CSVs e grades visuais por modelo/run
 └── requirements.txt
 ```
 
@@ -53,65 +57,89 @@ Divide por **paciente** (evita data leakage) em 70 % treino / 15 % validação /
 ### 2. Treinar
 
 ```bash
-# Configuração padrão: UNet++ + EfficientNet-B4, 100 épocas
+# Configuração padrão: UNet++ + EfficientNet-B2, 100 épocas
 python src/train.py
 
 # Personalizado
 python src/train.py --model unet --backbone resnet34 --epochs 50 --batch_size 8
 ```
 
-| Argumento        | Padrão             | Opções                             |
-| ---------------- | ------------------- | ------------------------------------ |
-| `--model`      | `unetpp`          | `unet`, `unetpp`, `deeplabv3p` |
-| `--backbone`   | `efficientnet-b4` | qualquer encoder do `timm`         |
-| `--epochs`     | `100`             | —                                   |
-| `--batch_size` | `16`              | —                                   |
-| `--lr`         | `1e-4`            | —                                   |
-| `--patience`   | `15`              | early stopping                       |
+| Argumento               | Padrão              | Opções / Descrição                                    |
+| ----------------------- | ------------------- | ------------------------------------------------------ |
+| `--model`               | `unetpp`             | `unet`, `unetpp`, `deeplabv3p`                          |
+| `--backbone`            | `efficientnet-b2`    | qualquer encoder suportado pelo `segmentation-models-pytorch` |
+| `--epochs`              | `100`                | —                                                        |
+| `--batch_size`          | `16`                 | —                                                        |
+| `--lr`                  | `1e-4`               | learning rate do decoder                                 |
+| `--patience`            | `10`                 | early stopping                                           |
+| `--num_workers`         | `4`                  | —                                                        |
+| `--amp` / `--no-amp`    | `True`               | precisão mista (menos VRAM, mais velocidade)             |
+| `--dropout`             | `0.3`                | dropout no decoder                                       |
+| `--weight_decay`        | `1e-3`               | regularização L2 (Adam)                                  |
+| `--encoder_lr_factor`   | `0.1`                | fator multiplicador do lr aplicado ao encoder pré-treinado (preserva conhecimento do ImageNet) |
 
-O melhor checkpoint é salvo em `checkpoints/<modelo>_<backbone>_best.pth` e o histórico de métricas em `checkpoints/<modelo>_<backbone>_history.csv`.
+Cada execução gera uma **versão nova** sem sobrescrever runs anteriores: `checkpoints/<modelo>_<backbone>_v<N>_best.pth` e `checkpoints/<modelo>_<backbone>_v<N>_history.csv`.
 
-### 3. Inferência e avaliação
+### 3. Inferência no conjunto de teste
 
 ```bash
-# Seleciona automaticamente o melhor checkpoint disponível
+# Seleciona automaticamente o checkpoint com maior val_dice
 python src/inference.py
 
 # Checkpoint específico
-python src/inference.py --checkpoint checkpoints/unet_resnet34_best.pth
+python src/inference.py --checkpoint checkpoints/unetpp_efficientnet-b2_v1_best.pth
 ```
 
-Gera em `results/<modelo>_<backbone>/`:
+Gera em `results/<modelo>_<backbone>_v<N>/`:
 
 - `test_predictions.csv` — métricas por amostra (Dice, IoU, Precision, Recall)
-- `test_summary.csv` — resumo estatístico (total, com tumor, sem tumor)
-- `best_predictions.png` — grade com as melhores segmentações
-- `worst_predictions.png` — grade com as piores segmentações
+- `pred_masks.npy` — máscaras preditas binárias (não versionado — regenerável a partir do checkpoint)
+- `model_info.json` — metadados do checkpoint (época, val_dice, val_iou)
+
+### 4. Análise e visualização
+
+```bash
+python src/analysis.py --predictions results/unetpp_efficientnet-b2_v1
+```
+
+A partir da saída da inferência, gera no mesmo diretório:
+
+- `test_summary.csv` — resumo estatístico por subconjunto (todas / com tumor / sem tumor)
 - `metrics_distribution.png` — histogramas de Dice e IoU
+- `best_predictions.png` / `worst_predictions.png` — grades com as melhores/piores segmentações (fatias com tumor)
+
+### 5. Curvas de treino
+
+```bash
+python src/plot_history.py --output_dir results/unetpp_efficientnet-b2_v1
+```
+
+Lê os CSVs de histórico em `checkpoints/` e gera `<modelo>_<backbone>_v<N>_training_curves.png` (loss, Dice, IoU e learning rate por época).
 
 ## Resultados
 
-Modelos treinados com early stopping (sem atingir as 100 épocas):
+Foram treinadas quatro iterações, testando arquitetura, tamanho de encoder e regularização para controlar o overfitting observado nos primeiros treinos:
 
-| Modelo | Backbone        | Melhor época | Val Dice |
-| ------ | --------------- | ------------- | -------- |
-| UNet   | ResNet34        | 8             | 0.585    |
-| UNet++ | EfficientNet-B0 | 24            | 0.592    |
+| Modelo             | Backbone         | Melhor época | Val Dice   | Gap treino/val | Dice (tumor) | IoU (tumor) | Recall (tumor) | Detecção |
+| ------------------- | ---------------- | :-----------: | :--------: | :-------------: | :-----------: | :----------: | :-------------: | :-------: |
+| UNet                | ResNet34          | 19            | 0.612      | 0.282           | 0.760         | 0.676        | 0.774            | 92.7 %    |
+| UNet++              | EfficientNet-B4   | 55            | 0.603      | 0.340           | **0.763**     | **0.686**    | 0.765            | **95.3 %** |
+| UNet++              | EfficientNet-B4 (regularizado) | 18 | 0.606      | 0.281           | 0.755         | 0.674        | 0.765            | 95.1 %    |
+| UNet                | ResNet18          | 35            | 0.751      | 0.082           | 0.681         | 0.603        | 0.692            | 90.3 %    |
+| UNet++              | EfficientNet-B0   | 35            | 0.775      | 0.059           | 0.722         | 0.639        | 0.768            | 89.0 %    |
+| **UNet++**          | **EfficientNet-B2** | **32**      | **0.778**  | **0.040**       | 0.743         | 0.656        | **0.819**        | 88.3 %    |
 
-**Métricas no conjunto de teste (fatias com tumor):**
+> Dados completos por modelo em [`results/comparacao_modelos.csv`](results/comparacao_modelos.csv). O Dice "geral" reportado pela inferência (~0.27–0.29 em todos os modelos) é enganoso: inclui as fatias sem tumor, onde o Dice é zero por definição matemática mesmo com predição correta. As colunas acima usam apenas as **fatias com tumor presente**.
 
-| Modelo             | Dice            | IoU             | Recall          | Detection Acc |
-| ------------------ | --------------- | --------------- | --------------- | ------------- |
-| UNet / ResNet34    | **0.731** | **0.644** | **0.788** | 91.9 %        |
-| UNet++ / EffNet-B0 | 0.698           | 0.623           | 0.694           | 92.5 %        |
-
-> O Dice "geral" (~0.27–0.29) é enganoso: inclui ~359 fatias sem tumor onde Dice=0 por definição matemática. O número relevante é o Dice nas **fatias com tumor** (acima).
+**Melhor modelo: UNet++ / EfficientNet-B2.** Não é o de Dice/IoU absolutamente mais alto — os encoders maiores (ResNet34, EfficientNet-B4) chegam a 0.75–0.76 — mas apresenta de longe o menor gap treino/validação do experimento (0.04 contra 0.28–0.34) e o maior recall entre os seis modelos (0.82), a métrica mais relevante em contexto clínico (menor chance de deixar passar um tumor). O detalhamento de cada iteração, as causas do overfitting e a justificativa das escolhas estão no relatório final.
 
 ## Arquitetura e Treinamento
 
 - **Modelos:** U-Net, U-Net++ e DeepLabV3+ via `segmentation-models-pytorch`
-- **Encoders:** pré-treinados no ImageNet
+- **Encoders testados:** ResNet18/34, EfficientNet-B0/B2/B4 — pré-treinados no ImageNet
 - **Loss:** 0.5 × DiceLoss + 0.5 × BCEWithLogitsLoss
-- **Otimizador:** Adam com `ReduceLROnPlateau` (modo max, fator 0.5, patience 5)
-- **Augmentations (treino):** flip horizontal, rotação ±15°, brilho/contraste, transformação elástica, crop aleatório
-- **Métricas:** Dice coefficient e IoU (calculados após sigmoid + binarização em 0.5)
+- **Otimizador:** Adam com learning rate diferenciado (encoder × `encoder_lr_factor`, decoder no `lr` completo), weight decay e `ReduceLROnPlateau` (modo max, fator 0.5, patience 5)
+- **Precisão mista (AMP):** reduz uso de VRAM e acelera o treino
+- **Augmentations (treino):** flip horizontal/vertical, rotação/translação/escala (`Affine`), transformação elástica e distorção em grade, zoom leve (`RandomResizedCrop`), brilho/contraste/gama, ruído gaussiano e blur leve, `CoarseDropout`
+- **Regularização:** dropout no decoder e weight decay, ajustados por iteração para conter o overfitting
+- **Métricas:** Dice coefficient, IoU, precisão e recall (calculados após sigmoid + binarização em 0.5)
