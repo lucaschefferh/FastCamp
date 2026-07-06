@@ -3,6 +3,11 @@ train.py
 ────────────────────────────────────────────────────────────────
 Loop de treinamento para segmentação de tumor cerebral (LGG MRI).
 
+Cada execução cria uma nova versão (v1, v2, v3 …) sem sobrescrever
+runs anteriores. Os arquivos gerados seguem o padrão:
+    checkpoints/<modelo>_<backbone>_v<N>_best.pth
+    checkpoints/<modelo>_<backbone>_v<N>_history.csv
+
 Uso básico:
     python src/train.py
 
@@ -11,6 +16,7 @@ Uso com argumentos:
 """
 
 import argparse
+import csv
 import time
 from pathlib import Path
 
@@ -20,7 +26,39 @@ import segmentation_models_pytorch as smp
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from dataset import get_dataloaders
+import albumentations as A
+from dataset import get_dataloaders, TRAIN_TRANSFORMS
+from models import MODEL_MAP, build_model
+from metrics import dice_coefficient, iou_score
+
+
+# ─────────────────────────────────────────────────────────────────
+# Versionamento de runs
+# ─────────────────────────────────────────────────────────────────
+
+def next_run_version(ckpt_dir: Path, model: str, backbone: str) -> str:
+    """
+    Retorna o próximo sufixo de versão (_v1, _v2, …) para um par
+    (model, backbone), garantindo que nenhum checkpoint existente
+    seja sobrescrito.
+    """
+    prefix = f"{model}_{backbone}_v"
+    existing = [
+        p for p in ckpt_dir.glob(f"{prefix}*_best.pth")
+    ]
+    used = set()
+    for p in existing:
+        # extrai o número entre 'v' e '_best'
+        stem = p.stem  # ex: unet_resnet34_v2_best
+        try:
+            n = int(stem.replace(f"{model}_{backbone}_v", "").replace("_best", ""))
+            used.add(n)
+        except ValueError:
+            pass
+    version = 1
+    while version in used:
+        version += 1
+    return f"v{version}"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -28,68 +66,31 @@ from dataset import get_dataloaders
 # ─────────────────────────────────────────────────────────────────
 
 DEFAULTS = {
-    "dataset_dir":  "dataset",
-    "checkpoints":  "checkpoints",
-    "model":        "unet",           # unet | unetpp | deeplabv3p
-    "backbone":     "resnet34",
-    "epochs":       100,
-    "batch_size":   16,
-    "lr":           1e-4,
-    "patience":     15,               # early stopping
-    "num_workers":  4,
+    "dataset_dir":        "dataset",
+    "checkpoints":        "checkpoints",
+    "model":              "unetpp",
+    "backbone":           "efficientnet-b2",
+    "epochs":             100,
+    "batch_size":         16,
+    "lr":                 1e-4,
+    "patience":           10,
+    "num_workers":        4,
+    "amp":                True,
+    "dropout":            0.3,
+    "weight_decay":       1e-3,
+    "encoder_lr_factor":  0.1,   # encoder usa lr * fator; decoder usa lr completo
 }
-
-
-# ─────────────────────────────────────────────────────────────────
-# Métricas
-# ─────────────────────────────────────────────────────────────────
-
-def dice_coefficient(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> float:
-    """Dice calculado sobre o batch inteiro, após binarização."""
-    preds = (torch.sigmoid(preds) > threshold).float()
-    intersection = (preds * targets).sum()
-    return (2.0 * intersection / (preds.sum() + targets.sum() + 1e-7)).item()
-
-
-def iou_score(preds: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5) -> float:
-    """Intersection over Union calculado sobre o batch inteiro."""
-    preds = (torch.sigmoid(preds) > threshold).float()
-    intersection = (preds * targets).sum()
-    union = preds.sum() + targets.sum() - intersection
-    return (intersection / (union + 1e-7)).item()
-
-
-# ─────────────────────────────────────────────────────────────────
-# Construção do modelo
-# ─────────────────────────────────────────────────────────────────
-
-MODEL_MAP = {
-    "unet":       smp.Unet,
-    "unetpp":     smp.UnetPlusPlus,
-    "deeplabv3p": smp.DeepLabV3Plus,
-}
-
-def build_model(model_name: str, backbone: str) -> nn.Module:
-    cls = MODEL_MAP.get(model_name)
-    if cls is None:
-        raise ValueError(f"Modelo '{model_name}' desconhecido. Opções: {list(MODEL_MAP)}")
-    return cls(
-        encoder_name=backbone,
-        encoder_weights="imagenet",
-        in_channels=3,
-        classes=1,
-        activation=None,   # logits brutos — perda e métricas aplicam sigmoid internamente
-    )
 
 
 # ─────────────────────────────────────────────────────────────────
 # Um epoch de treino / validação
 # ─────────────────────────────────────────────────────────────────
 
-def run_epoch(model, loader, criterion, optimizer, device, training: bool):
+def run_epoch(model, loader, criterion, optimizer, device, training: bool, scaler=None):
     model.train() if training else model.eval()
 
-    total_loss, total_dice, total_iou = 0.0, 0.0, 0.0
+    total_loss = 0.0
+    total_dice, total_iou, n_dice = 0.0, 0.0, 0
     context = torch.enable_grad() if training else torch.no_grad()
 
     with context:
@@ -97,22 +98,39 @@ def run_epoch(model, loader, criterion, optimizer, device, training: bool):
             images = images.to(device)
             masks  = masks.to(device)
 
-            preds = model(images)
-
-            # DiceLoss espera máscara (N, H, W) sem canal
-            loss = criterion(preds, masks.squeeze(1))
+            with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
+                preds = model(images)
+                loss  = criterion(preds, masks)
 
             if training:
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+                # treino: batch-level (rápido, não precisa de precisão por amostra)
+                total_dice += dice_coefficient(preds, masks)
+                total_iou  += iou_score(preds, masks)
+                n_dice += 1
+            else:
+                # validação: per-sample apenas em fatias com tumor
+                # torna val_dice comparável ao test_dice (with_tumor) da inferência
+                preds_bin = (torch.sigmoid(preds) > 0.5).float()
+                for pred_s, mask_s in zip(preds_bin, masks):
+                    if mask_s.sum() > 0:
+                        inter = (pred_s * mask_s).sum()
+                        total_dice += (2.0 * inter / (pred_s.sum() + mask_s.sum() + 1e-7)).item()
+                        total_iou  += (inter / (pred_s.sum() + mask_s.sum() - inter + 1e-7)).item()
+                        n_dice += 1
 
             total_loss += loss.item()
-            total_dice += dice_coefficient(preds, masks)
-            total_iou  += iou_score(preds, masks)
 
-    n = len(loader)
-    return total_loss / n, total_dice / n, total_iou / n
+    avg_dice = total_dice / n_dice if n_dice > 0 else 0.0
+    avg_iou  = total_iou  / n_dice if n_dice > 0 else 0.0
+    return total_loss / len(loader), avg_dice, avg_iou
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -123,7 +141,6 @@ def train(cfg: dict):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDispositivo: {device}")
 
-    # Dataloaders
     train_loader, val_loader, _ = get_dataloaders(
         cfg["dataset_dir"],
         batch_size=cfg["batch_size"],
@@ -131,24 +148,35 @@ def train(cfg: dict):
     )
     print(f"Batches — train: {len(train_loader)} | val: {len(val_loader)}")
 
-    # Modelo
-    model = build_model(cfg["model"], cfg["backbone"]).to(device)
-    print(f"Modelo: {cfg['model']} + {cfg['backbone']}\n")
+    model = build_model(cfg["model"], cfg["backbone"], dropout=cfg["dropout"]).to(device)
+    print(f"Modelo: {cfg['model']} + {cfg['backbone']} | dropout={cfg['dropout']} | weight_decay={cfg['weight_decay']} | AMP={cfg['amp']} | encoder_lr_factor={cfg['encoder_lr_factor']}\n")
 
-    # Perda: Dice + BCE (trata desbalanceamento de classes)
     dice_loss = smp.losses.DiceLoss(mode="binary", from_logits=True)
     bce_loss  = nn.BCEWithLogitsLoss()
     criterion = lambda preds, masks: 0.5 * dice_loss(preds, masks) + 0.5 * bce_loss(preds, masks)
 
-    optimizer = Adam(model.parameters(), lr=cfg["lr"])
+    encoder_params = [p for n, p in model.named_parameters() if n.startswith("encoder")]
+    decoder_params = [p for n, p in model.named_parameters() if not n.startswith("encoder")]
+    optimizer = Adam(
+        [
+            {"params": encoder_params, "lr": cfg["lr"] * cfg["encoder_lr_factor"]},
+            {"params": decoder_params, "lr": cfg["lr"]},
+        ],
+        weight_decay=cfg["weight_decay"],
+    )
     scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
 
-    # Checkpoint
-    ckpt_dir = Path(cfg["checkpoints"])
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / f"{cfg['model']}_{cfg['backbone']}_best.pth"
+    use_amp = cfg["amp"] and device.type == "cuda"
+    scaler  = torch.amp.GradScaler("cuda") if use_amp else None
 
-    # Early stopping
+    ckpt_dir  = Path(cfg["checkpoints"])
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    run_ver   = next_run_version(ckpt_dir, cfg["model"], cfg["backbone"])
+    run_stem  = f"{cfg['model']}_{cfg['backbone']}_{run_ver}"
+    ckpt_path = ckpt_dir / f"{run_stem}_best.pth"
+    print(f"Run: {run_stem}  →  {ckpt_path.name}")
+
     best_dice     = 0.0
     epochs_no_imp = 0
     history       = []
@@ -159,33 +187,33 @@ def train(cfg: dict):
     for epoch in range(1, cfg["epochs"] + 1):
         t0 = time.time()
 
-        train_loss, train_dice, _         = run_epoch(model, train_loader, criterion, optimizer, device, training=True)
-        val_loss,   val_dice,   val_iou   = run_epoch(model, val_loader,   criterion, optimizer, device, training=False)
+        train_loss, train_dice, train_iou = run_epoch(model, train_loader, criterion, optimizer, device, training=True,  scaler=scaler)
+        val_loss,   val_dice,   val_iou   = run_epoch(model, val_loader,   criterion, optimizer, device, training=False, scaler=None)
 
         scheduler.step(val_dice)
-        current_lr = optimizer.param_groups[0]["lr"]
+        current_lr = optimizer.param_groups[1]["lr"]   # LR do decoder (referência)
 
         history.append({
-            "epoch": epoch,
-            "train_loss": train_loss, "train_dice": train_dice,
-            "val_loss":   val_loss,   "val_dice":   val_dice, "val_iou": val_iou,
-            "lr": current_lr,
+            "epoch":      epoch,
+            "train_loss": train_loss, "train_dice": train_dice, "train_iou": train_iou,
+            "val_loss":   val_loss,   "val_dice":   val_dice,   "val_iou":   val_iou,
+            "lr":         current_lr,
         })
 
         elapsed = time.time() - t0
         print(f"{epoch:>6} | {train_loss:>10.4f} | {train_dice:>10.4f} | {val_loss:>9.4f} | {val_dice:>9.4f} | {val_iou:>8.4f} | {current_lr:>8.2e}  ({elapsed:.0f}s)")
 
-        # Salva melhor checkpoint
         if val_dice > best_dice:
-            best_dice = val_dice
+            best_dice     = val_dice
             epochs_no_imp = 0
             torch.save({
-                "epoch":       epoch,
-                "model_state": model.state_dict(),
+                "epoch":           epoch,
+                "model_state":     model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "val_dice":    val_dice,
-                "val_iou":     val_iou,
-                "cfg":         cfg,
+                "val_dice":        val_dice,
+                "val_iou":         val_iou,
+                "cfg":             cfg,
+                "train_transforms": A.to_dict(TRAIN_TRANSFORMS),
             }, ckpt_path)
             print(f"         ✓ checkpoint salvo (val_dice={val_dice:.4f})")
         else:
@@ -193,6 +221,14 @@ def train(cfg: dict):
             if epochs_no_imp >= cfg["patience"]:
                 print(f"\nEarly stopping na época {epoch} (sem melhora por {cfg['patience']} épocas)")
                 break
+
+    history_path = ckpt_dir / f"{run_stem}_history.csv"
+    if history:
+        with open(history_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(history[0].keys()))
+            writer.writeheader()
+            writer.writerows(history)
+        print(f"Histórico salvo em:  {history_path}")
 
     print(f"\nTreino concluído. Melhor val_dice: {best_dice:.4f}")
     print(f"Checkpoint salvo em: {ckpt_path}")
@@ -207,13 +243,17 @@ def parse_args():
     p = argparse.ArgumentParser(description="Treino de segmentação LGG MRI")
     p.add_argument("--dataset_dir",  default=DEFAULTS["dataset_dir"])
     p.add_argument("--checkpoints",  default=DEFAULTS["checkpoints"])
-    p.add_argument("--model",        default=DEFAULTS["model"],      choices=list(MODEL_MAP))
+    p.add_argument("--model",        default=DEFAULTS["model"],       choices=list(MODEL_MAP))
     p.add_argument("--backbone",     default=DEFAULTS["backbone"])
-    p.add_argument("--epochs",       default=DEFAULTS["epochs"],     type=int)
-    p.add_argument("--batch_size",   default=DEFAULTS["batch_size"], type=int)
-    p.add_argument("--lr",           default=DEFAULTS["lr"],         type=float)
-    p.add_argument("--patience",     default=DEFAULTS["patience"],   type=int)
-    p.add_argument("--num_workers",  default=DEFAULTS["num_workers"],type=int)
+    p.add_argument("--epochs",       default=DEFAULTS["epochs"],      type=int)
+    p.add_argument("--batch_size",   default=DEFAULTS["batch_size"],  type=int)
+    p.add_argument("--lr",           default=DEFAULTS["lr"],          type=float)
+    p.add_argument("--patience",     default=DEFAULTS["patience"],    type=int)
+    p.add_argument("--num_workers",  default=DEFAULTS["num_workers"], type=int)
+    p.add_argument("--amp",          default=DEFAULTS["amp"],          action=argparse.BooleanOptionalAction)
+    p.add_argument("--dropout",           default=DEFAULTS["dropout"],           type=float)
+    p.add_argument("--weight_decay",      default=DEFAULTS["weight_decay"],      type=float)
+    p.add_argument("--encoder_lr_factor", default=DEFAULTS["encoder_lr_factor"], type=float)
     return vars(p.parse_args())
 
 

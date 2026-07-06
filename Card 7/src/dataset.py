@@ -21,7 +21,7 @@ import numpy as np
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -31,17 +31,38 @@ from albumentations.pytorch import ToTensorV2
 # ─────────────────────────────────────────────────────────────────
 
 # Usados apenas no treino
+# Augmentações selecionadas para MRI cerebral clínico:
+#   - Flips e rotações leves simulam variações de posicionamento do paciente
+#   - GaussNoise simula ruído térmico natural do scanner MRI
+#   - GaussianBlur simula variações de resolução entre equipamentos
+#   - ElasticTransform/GridDistortion simulam variações anatômicas sutis
+#   - CoarseDropout com buracos pequenos (≤32px) simula artefatos de movimento e oclusão parcial
 TRAIN_TRANSFORMS = A.Compose([
+    # Geométricas — variações reais de posicionamento
     A.HorizontalFlip(p=0.5),
-    A.Rotate(limit=15, border_mode=cv2.BORDER_REFLECT_101, p=0.5),
-    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-    A.ElasticTransform(alpha=30, sigma=5, p=0.3),
+    A.VerticalFlip(p=0.5),
+    A.Affine(
+        translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
+        scale=(0.85, 1.15),
+        rotate=(-20, 20),
+        p=0.5,
+    ),
+    # Deformação anatômica suave
+    A.ElasticTransform(alpha=60, sigma=8, p=0.5),
+    A.GridDistortion(num_steps=5, distort_limit=0.1, p=0.2),
+    # Zoom leve
     A.RandomResizedCrop(
         size=(256, 256),
-        scale=(0.85, 1.0),   # zoom leve: no máximo 15% de crop
-        ratio=(1.0, 1.0),    # mantém aspecto quadrado
+        scale=(0.85, 1.0),
+        ratio=(1.0, 1.0),
         p=0.4,
     ),
+    # Intensidade — variações de contraste e ruído de scanner
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+    A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+    A.GaussNoise(std_range=(0.04, 0.20), p=0.5),
+    A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+    A.CoarseDropout(num_holes_range=(4, 8), hole_height_range=(16, 32), hole_width_range=(16, 32), p=0.3),
     A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ToTensorV2(),
 ])
@@ -154,8 +175,6 @@ def get_dataloaders(dataset_dir: str | Path, batch_size: int = 16, num_workers: 
     Uso:
         train_loader, val_loader, test_loader = get_dataloaders("dataset")
     """
-    from torch.utils.data import DataLoader
-
     train_ds, val_ds, test_ds = get_datasets(dataset_dir)
 
     train_loader = DataLoader(

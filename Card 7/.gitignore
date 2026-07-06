@@ -6,6 +6,9 @@ dataset/
 checkpoints/
 *.pth
 
+# Máscaras preditas (regeneráveis via inference.py, pesadas para o git)
+results/**/pred_masks.npy
+
 # Python
 __pycache__/
 *.py[cod]
