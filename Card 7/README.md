@@ -1,6 +1,14 @@
 # Brain MRI Segmentation — LGG Tumor
 
-Segmentação semântica de tumores cerebrais (Low-Grade Glioma) em imagens de MRI, usando PyTorch e `segmentation-models-pytorch`. O projeto cobre o pipeline completo: divisão do dataset, treinamento, inferência e análise quantitativa/visual dos resultados, com quatro iterações de treino documentadas em [`Relatório 7 - Lucas Scheffer.docx`](Relatório%207%20-%20Lucas%20Scheffer.docx).
+Segmentação semântica de tumores cerebrais (Low-Grade Glioma) em imagens de MRI, usando PyTorch e `segmentation-models-pytorch`. O projeto cobre o pipeline completo: divisão do dataset, treinamento, inferência e análise quantitativa/visual dos resultados, com quatro iterações de treino documentadas em [`Relatório 7 - Lucas Scheffer.pdf`](Relatório%207%20-%20Lucas%20Scheffer.pdf).
+
+## Vídeo Pitch
+
+📽️ **[Assista ao pitch do projeto (3 min)](videoDocumentacao.mp4)**
+
+Contextualização → problema → solução → principais diferenciais → resultados obtidos.
+
+> A apresentação completa, usada na defesa de 8 minutos, está em [`Apresentação - Segmentação Tumor Cerebral LGG-MRI.pdf`](Apresentação%20-%20Segmentação%20Tumor%20Cerebral%20LGG-MRI.pdf).
 
 ## Dataset
 
